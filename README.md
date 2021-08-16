@@ -1,4 +1,4 @@
-# netcheck
+# Netcheck
 This is a fork of the gping project (https://github.com/orf/gping)
 
 The key difference is that it computes the first 3 responding hops.  This makes it easier for normal people to troubleshoot their network connection and figure out if the problem is with WiFi or the Internet provider.  Gping requires the person to figure out how to use traceroute and type in the host IPs.
