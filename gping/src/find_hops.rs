@@ -1,6 +1,3 @@
-//TODO:
-//Support for MacOS users
-
 use std::process::{Command, Child, Stdio, ChildStdout};
 use std::io::{BufReader, BufRead};
 use dns_lookup::lookup_host;
