@@ -1,0 +1,9 @@
+[workspace]
+
+members = [
+    "gping",
+    "pinger"
+]
+
+[profile.release]
+lto = true
