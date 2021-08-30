@@ -22,6 +22,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 use structopt::StructOpt;
 use tui::backend::CrosstermBackend;
 use tui::layout::{Constraint, Direction, Layout};
@@ -32,6 +33,13 @@ use tui::Terminal;
 mod plot_data;
 mod find_hops;
 mod log;
+
+//Colors for time vs latency plot
+const HOP_COLORS : [Color;3] = [
+    Color::White,
+    Color::Cyan,
+    Color::LightMagenta,
+];
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "gping", about = "Ping, but with a graph.")]
@@ -266,13 +274,18 @@ fn main() -> Result<()> {
     #[cfg(target_os="windows")]
     {args.simple_graphics = true;}
     
-    if args.hosts_or_commands.len() == 0 {
+    //Enable bottom minimap when no host args are given
+    let enable_map = if args.hosts_or_commands.len() == 0 {
         print!("no hosts given, pinging the desired three hosts determined by tracert... : ");
         let hops = find_hops::get_desired_hops();
         args.hosts_or_commands.extend_from_slice(&hops);
         println!("{}, {}, {}", hops[0], hops[1], hops[2]);
+        true
     } else {
-    }
+        //Toggle minimap when host args are given
+        //True always enables minimap
+        true
+    };
 
     let mut data = vec![];
 
@@ -285,10 +298,17 @@ fn main() -> Result<()> {
                 get_host_ipaddr(host_or_cmd, args.ipv4, args.ipv6)?
             ),
         };
+        
+        //Applies color usage for time vs latency plot
+        let color = if idx < HOP_COLORS.len() {
+            HOP_COLORS[idx]
+        } else {
+            Color::Indexed(idx as u8 - HOP_COLORS.len() as u8 + 1)
+        };
         data.push(PlotData::new(
             display,
             args.buffer,
-            Style::default().fg(Color::Indexed(idx as u8 + 1)),
+            Style::default().fg(color),
             args.simple_graphics
         ));
     }
@@ -350,11 +370,16 @@ fn main() -> Result<()> {
     
     let mut logger = log::CsvLogger::new(args.hosts_or_commands.len());
     
+    let mut rolling_buffers : Vec<VecDeque<(Instant,Duration)>> = vec![VecDeque::new(); args.hosts_or_commands.len()];
+    
     loop {
         match rx.recv()? {
             Event::Update(host_id, update) => {
                 match update {
                     Update::Result(duration) => {
+                        if enable_map {
+                            rolling_buffers[host_id].push_back((Instant::now(),duration));
+                        }
                         app.update(host_id, Some(duration));
                         logger.log(host_id, Some(duration));
                     },
@@ -366,22 +391,36 @@ fn main() -> Result<()> {
                 };
                 terminal.draw(|f| {
                     // Split our
+                    let mut chart_height = f.size().height 
+                        - app.data.len() as u16
+                        - 2; // margin
+                    if enable_map { chart_height -= 4; }
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .margin(1)
                         .constraints(
-                            iter::repeat(Constraint::Length(1))
-                                .take(app.data.len())
-                                .chain(iter::once(Constraint::Percentage(10)))
-                                .collect::<Vec<_>>()
-                                .as_ref(),
+                            if enable_map {
+                                iter::repeat(Constraint::Length(1))
+                                    .take(app.data.len())
+                                    .chain(iter::once(Constraint::Length(chart_height)))
+                                    .chain(iter::once(Constraint::Length(4)))
+                                    .collect::<Vec<_>>()
+                            } else {
+                                iter::repeat(Constraint::Length(1))
+                                    .take(app.data.len())
+                                    .chain(iter::once(Constraint::Length(chart_height)))
+                                    .collect::<Vec<_>>()
+                            }
+                            
                         )
                         .split(f.size());
 
                     let total_chunks = chunks.len();
-
-                    let header_chunks = chunks[0..total_chunks - 1].to_owned();
-                    let chart_chunk = chunks[total_chunks - 1].to_owned();
+                    
+                    let n = if enable_map { 2 } else { 1 };
+                    
+                    let header_chunks = chunks[0..total_chunks - n].to_owned();
+                    let chart_chunk = chunks[total_chunks - n].to_owned();
 
                     for (plot_data, chunk) in app.data.iter().zip(header_chunks) {
                         let header_layout = Layout::default()
@@ -425,7 +464,136 @@ fn main() -> Result<()> {
                                 .labels(app.y_axis_labels(y_axis_bounds)),
                         );
 
-                    f.render_widget(chart, chart_chunk)
+                    f.render_widget(chart, chart_chunk);
+                    
+                    //Creates minimap
+                    if enable_map {
+                        let map_chunk = chunks[total_chunks - 1].to_owned();
+                        let map_box = Block::default()
+                            .borders(Borders::ALL);
+                        let map_inner = map_box.inner(map_chunk);
+                        f.render_widget(map_box, map_chunk);
+                        
+                        let extra_chunk_width = args.hosts_or_commands.last().unwrap().len().max("Internet Hop 2".len()) as u16;
+                        let width = map_inner.width;
+                        if width <= extra_chunk_width { return; }
+                        let remaining_width = width - extra_chunk_width;
+                        let num_normal_chunks = args.hosts_or_commands.len() as u16;
+                        let width_per_chunk = remaining_width / num_normal_chunks;
+                        
+                        let subchunks = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints(
+                                iter::repeat(Constraint::Length(width_per_chunk))
+                                .take(num_normal_chunks as usize)
+                                .chain(iter::once(Constraint::Length(extra_chunk_width)))
+                                .collect::<Vec<_>>()
+                                .as_ref()
+                            )
+                            .split(map_inner);
+                        
+                        for (i, (host, chunk)) in iter::once("Your device")
+                            .chain(args.hosts_or_commands[..args.hosts_or_commands.len()-1] .iter().map(|s| s.as_str()))
+                            
+                            .zip(subchunks.clone())
+                            .enumerate()
+                        {
+                            let name = match i {
+                                0 => "".to_owned(),
+                                1 => "Home Gateway".to_owned(),
+                                n => format!("Internet Hop {}",n-1)
+                            };
+                            
+                            let mut line2 = chunk.clone();
+                            line2.y += 1;
+                            if line2.height == 0 { return; }
+                            line2.height -= 1;
+                            
+                            f.render_widget(Block::default().title(Span::raw(name)), chunk);
+                            f.render_widget(Block::default().title(Span::raw(host)), line2);
+                            
+                            line2.x += host.len() as u16;
+                            if line2.width > host.len() as u16 {
+                                line2.width -= host.len() as u16
+                            } else {
+                                line2.width = 0;
+                            }
+                            
+                            let next_hop_latancy = rolling_buffers[i]
+                                .iter()
+                                .map(|(_, l)| l.clone())
+                                .max()
+                                .unwrap_or(Duration::from_secs(0));
+                            
+                            let latancy = if i > 0 {
+                                let this_hop_latancy = rolling_buffers[i-1]
+                                    .iter()
+                                    .map(|(_, l)| l.clone())
+                                    .max()
+                                    .unwrap_or(Duration::from_secs(0));
+                                
+                                if this_hop_latancy > next_hop_latancy {
+                                    Duration::from_secs(0)
+                                } else {
+                                    next_hop_latancy - this_hop_latancy
+                                }
+                            } else {
+                                next_hop_latancy
+                            };
+                            
+                            let color = if latancy <= Duration::from_millis(30) {
+                                Color::Green
+                            } else if latancy <= Duration::from_millis(60) {
+                                Color::Yellow
+                            } else if latancy <= Duration::from_millis(90) {
+                                Color::Rgb(0xFF, 0xA4, 0x00)
+                            } else {
+                                Color::Red
+                            };
+                            
+                            let mut bar = String::new();
+                            for _ in 0..line2.width {
+                                bar.push_str(tui::symbols::line::THICK_HORIZONTAL);
+                            }
+                            f.render_widget(Block::default().title(Span::styled(bar, Style::default().fg(color))), line2);
+                            
+                            
+                            loop {
+                                if let Some((recorded, _)) = rolling_buffers[i].front() {
+                                    if recorded.elapsed().as_secs() > 10 {
+                                        rolling_buffers[i].pop_front();
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            
+                            
+                            let latancy_string = format!("{:?}",latancy);
+                            
+                            if line2.width >= latancy_string.len() as u16 {
+                                let offset = (line2.width - latancy_string.len() as u16)/2;
+                                line2.x += offset;
+                                line2.width -= offset;
+                                line2.y -= 1;
+                                f.render_widget(Block::default().title(Span::raw(latancy_string)), line2);
+                            }
+                        }
+                        
+                        let mut extra_chunk = map_inner.clone();
+                        extra_chunk.width -= remaining_width;
+                        extra_chunk.x += remaining_width;
+                        let mut extra_chunk2 = extra_chunk.clone();
+                        extra_chunk2.y += 1;
+                        extra_chunk2.height -= 1;
+                        
+                        let n = subchunks.len() -1;
+                        let name = format!("Internet Hop {}",n-1);
+                        f.render_widget(Block::default().title(Span::raw(name)), extra_chunk);
+                        f.render_widget(Block::default().title(Span::raw(args.hosts_or_commands.last().unwrap())), extra_chunk2);
+                    }
                 })?;
             }
             Event::Input(input) => match input.code {
