@@ -1,6 +1,4 @@
 use chrono::prelude::*;
-use core::option::Option;
-use core::option::Option::{None, Some};
 use core::time::Duration;
 use itertools::Itertools;
 use tui::style::Style;
@@ -25,13 +23,10 @@ impl PlotData {
             simple_graphics,
         }
     }
-    pub fn update(&mut self, item: Option<Duration>) {
+    pub fn update(&mut self, dur: Duration) {
         let now = Local::now();
         let idx = now.timestamp_millis() as f64 / 1_000f64;
-        match item {
-            Some(dur) => self.data.push((idx, dur.as_micros() as f64)),
-            None => self.data.push((idx, f64::NAN)),
-        }
+        self.data.push((idx, dur.as_micros() as f64));
         // Find the last index that we should remove.
         let earliest_timestamp = (now - self.buffer).timestamp_millis() as f64 / 1_000f64;
         let last_idx = self
@@ -51,7 +46,6 @@ impl PlotData {
         let items: Vec<&f64> = self
             .data
             .iter()
-            .filter(|(_, x)| !x.is_nan())
             .sorted_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(_, v)| v)
             .collect();
@@ -67,7 +61,7 @@ impl PlotData {
         let p95 = items.get(rounded_position).map(|i| **i).unwrap_or(0f64);
 
         // count timeouts
-        let to = self.data.iter().filter(|(_, x)| x.is_nan()).count();
+        let to = self.data.iter().filter(|(_, x)| *x >= 1_000_000f64).count();
 
         vec![
             ping_header,
@@ -77,7 +71,7 @@ impl PlotData {
                 .style(self.style),
             Paragraph::new(format!("p95 {:?}", Duration::from_micros(p95 as u64)))
                 .style(self.style),
-            Paragraph::new(format!("timeout# {:?}", to)).style(self.style),
+            Paragraph::new(format!("timeout (>=1s)# {:?}", to)).style(self.style),
         ]
     }
 }
